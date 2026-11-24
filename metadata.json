@@ -1,0 +1,6 @@
+{
+  "name": "Titan IDE",
+  "description": "Full-stack mobile AI coding studio with 34 models, GitHub cloner, project file explorer, local REST API gateway, live runner, and voice agent.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,133 @@
+name: Titan Forge Cloud APK Build
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Accept Android SDK Licenses
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+
+      - name: Detect Build Mode & Prepare Gradle
+        id: prep
+        run: |
+          MODE="debug"
+          if [ -f ".titan_build_mode" ]; then
+            MODE="$(tr -d '[:space:]' < .titan_build_mode)"
+          fi
+          echo "mode=${MODE}" >> "$GITHUB_OUTPUT"
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            echo "cmd=./gradlew" >> "$GITHUB_OUTPUT"
+          else
+            echo "cmd=gradle" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build Debug APK
+        if: steps.prep.outputs.mode != 'release'
+        run: ${{ steps.prep.outputs.cmd }} assembleDebug -PTITAN_UPDATE_REPO="${{ github.repository }}" --no-daemon
+
+      - name: Build & Sign Release APK + Generate OTA update.json
+        if: steps.prep.outputs.mode == 'release'
+        env:
+          TITAN_KEYSTORE_B64: ${{ secrets.TITAN_KEYSTORE_B64 }}
+          GH_REPO_FULL: ${{ github.repository }}
+        run: |
+          ${{ steps.prep.outputs.cmd }} assembleRelease -PTITAN_UPDATE_REPO="$GH_REPO_FULL" --no-daemon
+          RAW_APK="$(find app/build/outputs/apk/release -type f -name '*.apk' | head -n 1)"
+          if [ -z "$RAW_APK" ]; then
+            echo "No release APK found!"
+            exit 1
+          fi
+          mkdir -p titan_release_out
+          BUILD_TOOLS="$(ls -d "${ANDROID_HOME}/build-tools/"* | sort -V | tail -n 1)"
+          if [ -n "$TITAN_KEYSTORE_B64" ]; then
+            echo "Using Permanent Titan Forge Keystore Vault..."
+            printf "%s" "$TITAN_KEYSTORE_B64" | base64 -d > titan_release.p12
+            KS_FILE="titan_release.p12"
+            KS_TYPE="PKCS12"
+          else
+            echo "Generating fallback release keystore..."
+            keytool -genkeypair -v \
+              -keystore titan_release.jks \
+              -alias titan_key \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass titan1234 -keypass titan1234 \
+              -dname "CN=TitanForge, OU=Mobile, O=DeveloperTahir, L=Kolkata, S=WB, C=IN"
+            KS_FILE="titan_release.jks"
+            KS_TYPE="JKS"
+          fi
+          "${BUILD_TOOLS}/zipalign" -v -p 4 "$RAW_APK" titan_release_out/aligned.apk
+          "${BUILD_TOOLS}/apksigner" sign \
+            --ks "$KS_FILE" \
+            --ks-type "$KS_TYPE" \
+            --ks-key-alias titan_key \
+            --ks-pass pass:titan1234 \
+            --key-pass pass:titan1234 \
+            --out titan_release_out/app-release-signed.apk \
+            titan_release_out/aligned.apk
+          rm -f titan_release_out/aligned.apk titan_release.jks titan_release.p12
+
+          # Extract versionCode & versionName safely for In-App OTA Auto-Updater
+          GFILE="app/build.gradle.kts"
+          [ -f "$GFILE" ] || GFILE="app/build.gradle"
+          VCODE="$(grep -E 'versionCode' "$GFILE" | head -n 1 | grep -oE '[0-9]+' | head -n 1 || true)"
+          VNAME="$(grep -E 'versionName' "$GFILE" | head -n 1 | sed -E 's/.*["'\'']([^"'\'']+)["'\''].*/\1/' || true)"
+          VCODE="${VCODE:-1}"
+          VNAME="${VNAME:-1.0}"
+          jq -n \
+            --argjson vc "$VCODE" \
+            --arg vn "$VNAME" \
+            --arg url "https://github.com/${GH_REPO_FULL}/releases/download/latest/app-release-signed.apk" \
+            --arg notes "Titan IDE v${VNAME} is ready with the latest upgrades & fixes." \
+            '{versionCode: $vc, versionName: $vn, apkUrl: $url, notes: $notes, forceUpdate: false}' \
+            > titan_release_out/update.json
+          cat titan_release_out/update.json
+
+      - name: Publish OTA Update to GitHub Releases (latest)
+        if: steps.prep.outputs.mode == 'release'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest titan_release_out/app-release-signed.apk titan_release_out/update.json --clobber
+          else
+            gh release create latest titan_release_out/app-release-signed.apk titan_release_out/update.json \
+              --title "Latest Release" \
+              --notes "Auto-published by Titan Forge v3.1 for zero-uninstall in-app updates."
+          fi
+
+      - name: Upload Debug APK
+        if: steps.prep.outputs.mode != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: titan-forge-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload Signed Release APK
+        if: steps.prep.outputs.mode == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: titan-forge-apk
+          path: titan_release_out/app-release-signed.apk
+          if-no-files-found: error
